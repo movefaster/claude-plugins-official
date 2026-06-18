@@ -70,6 +70,35 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](https://t.me/userinfobot)). Default policy is `pairing`. `ackReaction` only accepts Telegram's fixed emoji whitelist.
 
+## Remote TUI controls (fork addition)
+
+> Local addition in this fork — not in upstream.
+
+Some things can't go through the message path: channel messages are only read at
+turn boundaries (so they can't stop a running turn), and `/clear` / `/compact` are
+TUI-only slash commands. This fork lets an allowlisted sender drive them from
+Telegram by injecting keystrokes into the agent's TUI out-of-band. **Requires the
+session to run inside tmux** — the poller targets the pane via the inherited
+`$TMUX`/`$TMUX_PANE`, with no hardcoded socket or session name. Outside tmux these
+commands reply that they can't run and do nothing else.
+
+| Command | Effect |
+| --- | --- |
+| `/stop` (aliases `/esc`, `/cancel`, `/interrupt`, `/halt`) | Presses **Esc** to cancel the in-flight step. `/stop do X instead` interrupts *and* relays the remainder as the next turn, so you can stop-and-redirect in one message. |
+| `/clear` | Runs the TUI `/clear` to wipe the session context. |
+| `/compact [focus]` | Runs the TUI `/compact`, passing any trailing focus instructions through. |
+| `/rename [name]` | Runs the TUI `/rename` to retitle the session (in-place). With a name it sets it directly; with no arg Claude auto-generates one from history. |
+
+These commands are registered with Telegram (`setMyCommands`), so they autocomplete
+when you type `/` in the chat. `/stop`'s aliases are handled but not listed in the menu.
+
+These are intercepted in `handleInbound` and **not** relayed as prompts. `/clear`
+and `/compact` only register at an idle prompt, so the poller presses Esc first
+(cancels any running turn; no-op when idle), waits for the TUI to settle, then
+types the command. The bot acks on Telegram *before* `/clear` (which discards the
+agent's context); the poller is a separate process, so its replies — and future
+message handling — survive the clear.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |

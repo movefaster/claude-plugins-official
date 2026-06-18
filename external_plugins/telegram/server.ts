@@ -19,6 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
+import { spawn } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -82,6 +83,17 @@ process.on('uncaughtException', err => {
 // 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+// A leading /stop (or alias) from an allowlisted sender interrupts the running
+// turn instead of being relayed as chat — see sendInterrupt(). \b after the verb
+// keeps "/stopwatch" etc. from matching; capture group 2 is an optional redirect
+// ("/stop do X instead") relayed as the next turn.
+const INTERRUPT_RE = /^\s*\/(stop|esc|cancel|interrupt|halt)\b\s*([\s\S]*)$/i
+// TUI-only slash commands injected into the agent's pane (see runSlashCommand).
+// /clear takes no args; /compact accepts optional focus instructions, relayed as-is.
+const CLEAR_RE = /^\s*\/clear\b/i
+const COMPACT_RE = /^\s*\/compact\b/i
+// /rename [name] → retitle the session (in-place); no arg lets Claude auto-name it.
+const RENAME_RE = /^\s*\/rename\b\s*([\s\S]*)$/i
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
@@ -897,6 +909,48 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// --- out-of-band TUI control via tmux ----------------------------------------
+// The MCP server is spawned by `claude`, which runs inside tmux, so it inherits
+// $TMUX (which server/socket) and $TMUX_PANE (which pane) — we drive the agent's
+// TUI by injecting keystrokes there, with NO hardcoded socket or session name.
+// This reaches controls the message path can't: interrupting a running turn, and
+// the TUI-only slash commands /clear and /compact.
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+function inTmux(): boolean {
+  return !!(process.env.TMUX && process.env.TMUX_PANE)
+}
+function tmuxSendKeys(args: string[]): boolean {
+  const pane = process.env.TMUX_PANE
+  if (!process.env.TMUX || !pane) {
+    process.stderr.write('telegram channel: keystroke injection skipped — not inside tmux\n')
+    return false
+  }
+  try {
+    const p = spawn('tmux', ['send-keys', '-t', pane, ...args], { stdio: 'ignore' })
+    p.on('error', err => process.stderr.write(`telegram channel: send-keys failed: ${err}\n`))
+    return true
+  } catch (err) {
+    process.stderr.write(`telegram channel: send-keys failed: ${err}\n`)
+    return false
+  }
+}
+// A single ESC cancels the in-flight tool and returns the agent to idle. Exactly
+// ONE — double-ESC would rewind a checkpoint.
+function sendInterrupt(): boolean {
+  return tmuxSendKeys(['Escape'])
+}
+// Run a TUI-only slash command (/clear, /compact). These register only at an idle
+// prompt, so ESC first (cancels any running turn; no-op when idle), let the TUI
+// settle, type the command literally (-l so it's text, not tmux key names), then
+// submit with Enter.
+async function runSlashCommand(cmd: string): Promise<boolean> {
+  if (!tmuxSendKeys(['Escape'])) return false
+  await sleep(500)
+  if (!tmuxSendKeys(['-l', '--', cmd])) return false
+  await sleep(150)
+  return tmuxSendKeys(['Enter'])
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -939,6 +993,60 @@ async function handleInbound(
         { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
       ]).catch(() => {})
     }
+    return
+  }
+
+  // Interrupt intercept: a leading /stop (or alias) from an allowlisted sender
+  // cancels the in-flight turn (ESC into the TUI) rather than being relayed as a
+  // new prompt. Any text after /stop is relayed normally so you can stop-and-
+  // redirect in one message. Sender is gate()-approved at this point.
+  const interruptMatch = INTERRUPT_RE.exec(text)
+  if (interruptMatch) {
+    if (!sendInterrupt()) {
+      void ctx.reply('⚠️ Could not interrupt — agent is not running inside tmux.')
+      return
+    }
+    const rest = interruptMatch[2]?.trim()
+    if (!rest) {
+      void ctx.reply('🛑 Interrupt sent — canceled the current step.')
+      return
+    }
+    void ctx.reply('🛑 Interrupt sent — switching to your new instruction…')
+    text = rest // fall through: relay the redirect via the normal channel path
+  }
+
+  // TUI-only slash commands: /clear (wipes context) and /compact (summarizes) can
+  // only run at the prompt, not via the message path — inject them into the pane.
+  // Reply first: /clear discards the agent's context (the poller is a separate
+  // process and keeps answering future messages via each inbound's chat_id).
+  if (CLEAR_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /clear — agent is not running inside tmux.')
+      return
+    }
+    void ctx.reply('🧹 Clearing the session context…')
+    await runSlashCommand('/clear')
+    return
+  }
+  if (COMPACT_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /compact — agent is not running inside tmux.')
+      return
+    }
+    void ctx.reply('🗜️ Compacting the session… (this can take a moment)')
+    await runSlashCommand(text.trim()) // preserve any "/compact <focus>" instructions
+    return
+  }
+  // /rename [name] → retitle the session in-place (no relaunch; MCP stays up). With
+  // a name it sets it directly; with no arg Claude auto-generates one from history.
+  if (RENAME_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /rename — agent is not running inside tmux.')
+      return
+    }
+    const name = (RENAME_RE.exec(text)?.[1] ?? '').trim()
+    void ctx.reply(name ? `🏷️ Renaming the session to “${name}”…` : '🏷️ Auto-renaming the session…')
+    await runSlashCommand(name ? `/rename ${name}` : '/rename')
     return
   }
 
@@ -1009,6 +1117,11 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              // remote TUI controls (fork addition) — autocomplete when typing /
+              { command: 'stop', description: 'Interrupt the running turn (Esc)' },
+              { command: 'clear', description: 'Clear the session context' },
+              { command: 'compact', description: 'Compact the conversation' },
+              { command: 'rename', description: 'Rename this session' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
