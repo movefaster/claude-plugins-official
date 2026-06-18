@@ -20,7 +20,7 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'gramm
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { spawn } from 'child_process'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, readSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -94,6 +94,13 @@ const CLEAR_RE = /^\s*\/clear\b/i
 const COMPACT_RE = /^\s*\/compact\b/i
 // /rename [name] → retitle the session (in-place); no arg lets Claude auto-name it.
 const RENAME_RE = /^\s*\/rename\b\s*([\s\S]*)$/i
+// /resume: no arg → list sessions; <number> → pick from the last list; <id|prefix>
+// → resume directly. Telegram-rendered picker (Claude has no non-interactive list).
+const RESUME_RE = /^\s*\/resume\b\s*([\s\S]*)$/i
+// The listener runs from $HOME, so its session transcripts live under the project
+// dir for that cwd (Claude encodes the path by replacing '/' with '-').
+const PROJECT_DIR = join(homedir(), '.claude', 'projects', homedir().replace(/\//g, '-'))
+const MAX_RESUME_LIST = 8
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
@@ -742,6 +749,29 @@ bot.command('status', async ctx => {
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+  // Resume buttons: `resume:<session-id>`. Gate on allowFrom like the perm path,
+  // then inject `/resume <id>` (relaunches — channels re-attach — and kills this
+  // poller, so update the message first).
+  const rm = /^resume:([0-9a-f-]{6,})$/i.exec(data)
+  if (rm) {
+    if (!loadAccess().allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    if (!inTmux()) {
+      await ctx.answerCallbackQuery({ text: 'Agent is not running inside tmux.' }).catch(() => {})
+      return
+    }
+    const id = resolveSessionId(rm[1])
+    if (!id) {
+      await ctx.answerCallbackQuery({ text: 'Session no longer available.' }).catch(() => {})
+      return
+    }
+    await ctx.answerCallbackQuery({ text: 'Resuming…' }).catch(() => {})
+    await ctx.editMessageText(`↩️ Resuming session ${id.slice(0, 8)}… (relaunching)`).catch(() => {})
+    await runSlashCommand(`/resume ${id}`)
+    return
+  }
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -951,6 +981,177 @@ async function runSlashCommand(cmd: string): Promise<boolean> {
   return tmuxSendKeys(['Enter'])
 }
 
+// --- /resume: a session picker rendered as Telegram buttons ------------------
+// Claude has no non-interactive "list sessions", so we enumerate transcripts
+// ourselves and present clickable buttons; selecting one injects `/resume <id>`
+// (resumes by id with no picker — verified). One JSONL per session, id == name.
+// All workspace sessions are offered, not just telegram-driven ones, and each
+// button shows the opening message plus the last few to jog memory.
+type SessionInfo = { id: string; mtime: number; telegram: boolean; first: string; recent: string[]; title?: string }
+const CHANNEL_TAG_RE = /<channel\b[^>]*\bsource="[^"]*telegram[^"]*"[^>]*>/
+
+function readChunk(file: string, bytes: number, fromEnd: boolean): string {
+  const fd = openSync(file, 'r')
+  try {
+    const size = statSync(file).size
+    const len = Math.min(bytes, size)
+    const pos = fromEnd ? size - len : 0
+    const buf = Buffer.alloc(len)
+    const n = readSync(fd, buf, 0, len, pos)
+    return buf.subarray(0, n).toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// Plain text of a user/assistant message — text blocks only (skips tool calls,
+// tool results, thinking) with channel/command/reminder wrappers stripped.
+function entryText(o: any): string {
+  if (o?.isSidechain) return '' // subagent sidechain turn, not a real conversation message
+  const role = o?.message?.role ?? o?.role
+  if (role !== 'user' && role !== 'assistant') return ''
+  const c = o?.message?.content ?? o?.content
+  let text = ''
+  if (typeof c === 'string') text = c
+  else if (Array.isArray(c)) {
+    text = c
+      .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b: any) => b.text)
+      .join(' ')
+    if (!text) text = c.filter((b: any) => typeof b === 'string').join(' ')
+  }
+  // drop machine-injected wrappers (context, task notifications, slash-command
+  // echoes, local-command output) so previews read like real prose
+  return text
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, ' ')
+    .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, ' ')
+    .replace(/<local-command-[a-z-]+>[\s\S]*?<\/local-command-[a-z-]+>/g, ' ')
+    .replace(/<command-(name|message|args)>[\s\S]*?<\/command-(name|message|args)>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+// First substantive message + the last few, for the picker. null = empty/fresh
+// session (no user/assistant text yet) → skip it.
+function sessionPreview(file: string): { telegram: boolean; first: string; recent: string[]; title?: string } | null {
+  let head: string
+  try {
+    head = readChunk(file, 256 * 1024, false)
+  } catch {
+    return null
+  }
+  let first = ''
+  let telegram = false
+  for (const line of head.split('\n')) {
+    if (!line) continue
+    let o: any
+    try {
+      o = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if ((o?.message?.role ?? o?.role ?? o?.type) !== 'user') continue
+    const t = entryText(o)
+    if (!t) continue
+    const raw = o?.message?.content ?? o?.content
+    const decoded =
+      typeof raw === 'string'
+        ? raw
+        : Array.isArray(raw)
+          ? raw.map((b: any) => (typeof b === 'string' ? b : (b?.text ?? ''))).join(' ')
+          : ''
+    first = t
+    telegram = CHANNEL_TAG_RE.test(decoded)
+    break
+  }
+  if (!first) return null
+  // the last few of the USER's OWN messages from the tail (not agent turns); wide
+  // tail so 3 user turns are captured even after long agent work between them.
+  // (drop the partial first line of the slice)
+  // also pick up the session's latest title (set by /rename or auto-naming, stored
+  // as a `custom-title` entry) so a named session shows that name in the picker.
+  const recent: string[] = []
+  let title: string | undefined
+  try {
+    for (const line of readChunk(file, 1024 * 1024, true).split('\n').slice(1)) {
+      if (!line) continue
+      let o: any
+      try {
+        o = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (o?.type === 'custom-title' && typeof o.customTitle === 'string' && o.customTitle.trim()) {
+        title = o.customTitle.trim() // last one in the tail = most recent
+        continue
+      }
+      if ((o?.message?.role ?? o?.role) !== 'user') continue // only my messages
+      const t = entryText(o)
+      if (t) recent.push(t)
+    }
+  } catch {}
+  // keep the last 3 DISTINCT user messages (skip the opener echo and any repeats)
+  const recent3: string[] = []
+  const seen = new Set<string>()
+  for (let i = recent.length - 1; i >= 0 && recent3.length < 3; i--) {
+    const r = recent[i]
+    if (r === first || seen.has(r)) continue
+    seen.add(r)
+    recent3.unshift(r)
+  }
+  return { telegram, first, recent: recent3, title }
+}
+
+function listSessions(): SessionInfo[] {
+  let files: string[]
+  try {
+    files = readdirSync(PROJECT_DIR).filter(f => f.endsWith('.jsonl'))
+  } catch {
+    return []
+  }
+  const out: SessionInfo[] = []
+  for (const f of files) {
+    const full = join(PROJECT_DIR, f)
+    const info = sessionPreview(full)
+    if (!info) continue // empty/fresh session — nothing to show
+    let mtime = 0
+    try {
+      mtime = statSync(full).mtimeMs
+    } catch {}
+    out.push({ id: f.replace(/\.jsonl$/, ''), mtime, ...info })
+  }
+  out.sort((a, b) => b.mtime - a.mtime)
+  return out.slice(0, MAX_RESUME_LIST)
+}
+
+function ago(ms: number): string {
+  const s = Math.max(0, (Date.now() - ms) / 1000)
+  if (s < 90) return 'just now'
+  if (s < 5400) return `${Math.round(s / 60)}m ago`
+  if (s < 129600) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+function ellipsize(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s
+}
+
+// Resolve a raw arg (full id or unique prefix) to an existing session id.
+function resolveSessionId(arg: string): string | null {
+  if (!/^[0-9a-f-]{6,}$/i.test(arg)) return null
+  let ids: string[]
+  try {
+    ids = readdirSync(PROJECT_DIR)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => f.replace(/\.jsonl$/, ''))
+  } catch {
+    return null
+  }
+  if (ids.includes(arg)) return arg
+  const matches = ids.filter(id => id.startsWith(arg))
+  return matches.length === 1 ? matches[0] : null
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1037,6 +1238,61 @@ async function handleInbound(
     await runSlashCommand(text.trim()) // preserve any "/compact <focus>" instructions
     return
   }
+  // /resume: no arg → clickable session buttons (the callback handler resumes);
+  // <id|prefix> → resume directly. Resuming RELAUNCHES the session (channels
+  // re-attach), which kills this poller — so ack BEFORE injecting.
+  if (RESUME_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /resume — agent is not running inside tmux.')
+      return
+    }
+    const arg = (RESUME_RE.exec(text)?.[1] ?? '').trim()
+    if (!arg) {
+      const sessions = listSessions()
+      if (!sessions.length) {
+        void ctx.reply('No resumable sessions found in this workspace.')
+        return
+      }
+      // Readable text preview (opener + your last 3, ~100 chars each) kept under
+      // Telegram's 4096-char limit, with short inline buttons BELOW the message;
+      // tapping one fires the resume:<id> callback handler. The numbered button
+      // labels line up with the numbered text blocks.
+      const blocks: string[] = []
+      const kb = new InlineKeyboard()
+      let used = 0
+      for (const s of sessions) {
+        const n = blocks.length + 1
+        const sid = s.id.slice(0, 8)
+        const marker = s.telegram ? '📱' : '💻'
+        // headline shows the session title when set (🏷️), else just marker/time/id
+        const hdr = s.title
+          ? `${n}. 🏷️ ${ellipsize(s.title, 50)} · ${marker} ${ago(s.mtime)} · id ${sid}`
+          : `${n}. ${marker} ${ago(s.mtime)} · id ${sid}`
+        const lines = [hdr]
+        lines.push(`▸ ${ellipsize(s.first, 100)}`)
+        for (const r of s.recent) lines.push(`· ${ellipsize(r, 100)}`)
+        const block = lines.join('\n')
+        if (used + block.length + 2 > 3900) break
+        blocks.push(block)
+        used += block.length + 2
+        kb.text(s.title ? `${n}. 🏷️ ${ellipsize(s.title, 40)}` : `${n}. ${marker} ${sid}`, `resume:${s.id}`).row()
+      }
+      const more = sessions.length - blocks.length
+      const note = more > 0 ? `\n\n(+${more} older not shown)` : ''
+      await ctx.reply(`↩️ Recent sessions — tap a button below to resume:\n\n${blocks.join('\n\n')}${note}`, {
+        reply_markup: kb,
+      })
+      return
+    }
+    const targetId = resolveSessionId(arg)
+    if (!targetId) {
+      void ctx.reply(`No session matching "${arg.slice(0, 40)}". Send /resume to list.`)
+      return
+    }
+    await ctx.reply('↩️ Resuming… (relaunching — back in a moment)')
+    await runSlashCommand(`/resume ${targetId}`)
+    return
+  }
   // /rename [name] → retitle the session in-place (no relaunch; MCP stays up). With
   // a name it sets it directly; with no arg Claude auto-generates one from history.
   if (RENAME_RE.test(text)) {
@@ -1121,6 +1377,7 @@ void (async () => {
               { command: 'stop', description: 'Interrupt the running turn (Esc)' },
               { command: 'clear', description: 'Clear the session context' },
               { command: 'compact', description: 'Compact the conversation' },
+              { command: 'resume', description: 'Resume a past session' },
               { command: 'rename', description: 'Rename this session' },
             ],
             { scope: { type: 'all_private_chats' } },

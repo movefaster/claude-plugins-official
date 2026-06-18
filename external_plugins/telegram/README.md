@@ -75,8 +75,8 @@ Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](htt
 > Local addition in this fork — not in upstream.
 
 Some things can't go through the message path: channel messages are only read at
-turn boundaries (so they can't stop a running turn), and `/clear` / `/compact` are
-TUI-only slash commands. This fork lets an allowlisted sender drive them from
+turn boundaries (so they can't stop a running turn), and `/clear`, `/compact`, and
+`/resume` are TUI-only slash commands. This fork lets an allowlisted sender drive them from
 Telegram by injecting keystrokes into the agent's TUI out-of-band. **Requires the
 session to run inside tmux** — the poller targets the pane via the inherited
 `$TMUX`/`$TMUX_PANE`, with no hardcoded socket or session name. Outside tmux these
@@ -88,6 +88,7 @@ commands reply that they can't run and do nothing else.
 | `/clear` | Runs the TUI `/clear` to wipe the session context. |
 | `/compact [focus]` | Runs the TUI `/compact`, passing any trailing focus instructions through. |
 | `/rename [name]` | Runs the TUI `/rename` to retitle the session (in-place). With a name it sets it directly; with no arg Claude auto-generates one from history. |
+| `/resume` | Replies with a text list of recent workspace sessions (each session's **title** if set via `/rename`, else its opener + **your** last 3 messages, ~100 chars each) plus **inline buttons below the message** — tap one to resume. `/resume <id\|prefix>` also works typed. Resuming relaunches the session (channels re-attach). |
 
 These commands are registered with Telegram (`setMyCommands`), so they autocomplete
 when you type `/` in the chat. `/stop`'s aliases are handled but not listed in the menu.
@@ -98,6 +99,18 @@ and `/compact` only register at an idle prompt, so the poller presses Esc first
 types the command. The bot acks on Telegram *before* `/clear` (which discards the
 agent's context); the poller is a separate process, so its replies — and future
 message handling — survive the clear.
+
+`/resume` enumerates sessions itself — Claude has no non-interactive "list
+sessions", so the poller scans the transcript dir (`~/.claude/projects/<cwd>/<id>.jsonl`)
+for every session in the workspace (📱 = telegram-driven, 💻 = terminal). It replies
+with a readable text preview — each session's opener plus **your** last few messages
+(user-role only; sidechain/notification noise stripped), ~100 chars each — and an
+**inline keyboard below the message** with one short button per session (number +
+📱/💻 + short id). Tapping a button fires a `callback_query` (`resume:<id>`),
+handled in the existing callback handler and gated on `allowFrom` like permission
+approvals; it injects `/resume <id>` into the TUI — resumes by id with no picker
+(and relaunches, re-attaching channels). No per-chat state is needed (the id rides
+in the button's `callback_data`). A typed `/resume <id|prefix>` also works.
 
 ## Tools exposed to the assistant
 
