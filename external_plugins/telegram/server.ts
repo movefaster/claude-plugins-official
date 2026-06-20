@@ -97,6 +97,8 @@ const RENAME_RE = /^\s*\/rename\b\s*([\s\S]*)$/i
 // /resume: no arg → list sessions; <number> → pick from the last list; <id|prefix>
 // → resume directly. Telegram-rendered picker (Claude has no non-interactive list).
 const RESUME_RE = /^\s*\/resume\b\s*([\s\S]*)$/i
+// /capture → read the agent's tmux pane and send it to Telegram for inspection (read-only).
+const CAPTURE_RE = /^\s*\/capture\b/i
 // The listener runs from $HOME, so its session transcripts live under the project
 // dir for that cwd (Claude encodes the path by replacing '/' with '-').
 const PROJECT_DIR = join(homedir(), '.claude', 'projects', homedir().replace(/\//g, '-'))
@@ -981,6 +983,57 @@ async function runSlashCommand(cmd: string): Promise<boolean> {
   return tmuxSendKeys(['Enter'])
 }
 
+// Read the agent's tmux pane (recent scrollback through the visible screen) as
+// plain text — read-only, injects nothing. Non-blocking with a hard timeout so a
+// wedged tmux can't stall the poller. Same capture the watchdog uses, on demand.
+function captureTmux(scrollback = 200): Promise<string> {
+  return new Promise(resolve => {
+    const pane = process.env.TMUX_PANE
+    if (!process.env.TMUX || !pane) return resolve('')
+    let out = ''
+    try {
+      const p = spawn('tmux', ['capture-pane', '-p', '-t', pane, '-S', `-${scrollback}`])
+      const to = setTimeout(() => {
+        try {
+          p.kill()
+        } catch {}
+        resolve('')
+      }, 4000)
+      p.stdout.on('data', d => {
+        out += d
+      })
+      p.on('error', () => {
+        clearTimeout(to)
+        resolve('')
+      })
+      p.on('close', () => {
+        clearTimeout(to)
+        resolve(out.replace(/[ \t]+$/gm, '').replace(/^\n+/, '').replace(/\n+$/, ''))
+      })
+    } catch {
+      resolve('')
+    }
+  })
+}
+// Send a pane snapshot as a monospaced block. Tries a MarkdownV2 code fence
+// (escaping ` and \ inside) and falls back to plain text so a parse error never
+// drops the message; tail-trimmed to keep the most recent rows under the limit.
+async function sendCapture(ctx: Context, capture: string): Promise<void> {
+  const header = '📷 Terminal pane'
+  const MAXCAP = 3500
+  const body = capture.length > MAXCAP ? '…\n' + capture.slice(capture.length - MAXCAP) : capture
+  const fenced = '```\n' + body.replace(/\\/g, '\\\\').replace(/`/g, '\\`') + '\n```'
+  const md = `${header}\n\n${fenced}`
+  if (md.length <= MAX_CHUNK_LIMIT) {
+    try {
+      await ctx.reply(md, { parse_mode: 'MarkdownV2' })
+      return
+    } catch {}
+  }
+  const plain = `${header}\n\n${body}`
+  await ctx.reply(plain.length > MAX_CHUNK_LIMIT ? plain.slice(0, MAX_CHUNK_LIMIT - 1) + '…' : plain).catch(() => {})
+}
+
 // --- /resume: a session picker rendered as Telegram buttons ------------------
 // Claude has no non-interactive "list sessions", so we enumerate transcripts
 // ourselves and present clickable buttons; selecting one injects `/resume <id>`
@@ -1305,6 +1358,21 @@ async function handleInbound(
     await runSlashCommand(name ? `/rename ${name}` : '/rename')
     return
   }
+  // /capture → snapshot the agent's terminal pane back to Telegram for inspection.
+  // Read-only: unlike the others it injects nothing, so it's safe mid-turn.
+  if (CAPTURE_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /capture — agent is not running inside tmux.')
+      return
+    }
+    const pane = await captureTmux()
+    if (!pane) {
+      void ctx.reply('⚠️ Captured nothing — the pane was empty or tmux did not respond.')
+      return
+    }
+    await sendCapture(ctx, pane)
+    return
+  }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
@@ -1377,6 +1445,7 @@ void (async () => {
               { command: 'stop', description: 'Interrupt the running turn (Esc)' },
               { command: 'clear', description: 'Clear the session context' },
               { command: 'compact', description: 'Compact the conversation' },
+              { command: 'capture', description: 'Send the terminal screen to Telegram' },
               { command: 'resume', description: 'Resume a past session' },
               { command: 'rename', description: 'Rename this session' },
             ],

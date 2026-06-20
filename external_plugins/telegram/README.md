@@ -87,6 +87,7 @@ commands reply that they can't run and do nothing else.
 | `/stop` (aliases `/esc`, `/cancel`, `/interrupt`, `/halt`) | Presses **Esc** to cancel the in-flight step. `/stop do X instead` interrupts *and* relays the remainder as the next turn, so you can stop-and-redirect in one message. |
 | `/clear` | Runs the TUI `/clear` to wipe the session context. |
 | `/compact [focus]` | Runs the TUI `/compact`, passing any trailing focus instructions through. |
+| `/capture` | Snapshots the agent's terminal pane (recent scrollback + the visible screen) back to Telegram as a monospaced block. **Read-only** — injects nothing, so it's safe to run mid-turn to check what the session is doing. |
 | `/rename [name]` | Runs the TUI `/rename` to retitle the session (in-place). With a name it sets it directly; with no arg Claude auto-generates one from history. |
 | `/resume` | Replies with a text list of recent workspace sessions (each session's **title** if set via `/rename`, else its opener + **your** last 3 messages, ~100 chars each) plus **inline buttons below the message** — tap one to resume. `/resume <id\|prefix>` also works typed. Resuming relaunches the session (channels re-attach). |
 
