@@ -99,6 +99,11 @@ const RENAME_RE = /^\s*\/rename\b\s*([\s\S]*)$/i
 const RESUME_RE = /^\s*\/resume\b\s*([\s\S]*)$/i
 // /capture → read the agent's tmux pane and send it to Telegram for inspection (read-only).
 const CAPTURE_RE = /^\s*\/capture\b/i
+// /effort [level] → set the model reasoning effort. Applies even mid-response, so
+// (unlike the other TUI controls) it's injected WITHOUT a leading Esc — setting it
+// mustn't cancel a running turn. No arg → a button picker, like /resume.
+const EFFORT_RE = /^\s*\/effort\b\s*([\s\S]*)$/i
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode', 'auto']
 // The listener runs from $HOME, so its session transcripts live under the project
 // dir for that cwd (Claude encodes the path by replacing '/' with '-').
 const PROJECT_DIR = join(homedir(), '.claude', 'projects', homedir().replace(/\//g, '-'))
@@ -774,6 +779,27 @@ bot.on('callback_query:data', async ctx => {
     await runSlashCommand(`/resume ${id}`)
     return
   }
+  // Effort buttons: `effort:<level>`. Gate like the resume path, then set it via
+  // typeSlashCommand (no Esc — /effort applies mid-response, don't cancel the turn).
+  if (data.startsWith('effort:')) {
+    const level = data.slice('effort:'.length)
+    if (!loadAccess().allowFrom.includes(String(ctx.from.id))) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    if (!inTmux()) {
+      await ctx.answerCallbackQuery({ text: 'Agent is not running inside tmux.' }).catch(() => {})
+      return
+    }
+    if (!EFFORT_LEVELS.includes(level)) {
+      await ctx.answerCallbackQuery({ text: 'Unknown effort level.' }).catch(() => {})
+      return
+    }
+    await ctx.answerCallbackQuery({ text: `Effort: ${level}` }).catch(() => {})
+    await ctx.editMessageText(`🧠 Effort set to ${level}.`).catch(() => {})
+    await typeSlashCommand(`/effort ${level}`)
+    return
+  }
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -978,6 +1004,13 @@ function sendInterrupt(): boolean {
 async function runSlashCommand(cmd: string): Promise<boolean> {
   if (!tmuxSendKeys(['Escape'])) return false
   await sleep(500)
+  if (!tmuxSendKeys(['-l', '--', cmd])) return false
+  await sleep(150)
+  return tmuxSendKeys(['Enter'])
+}
+// Like runSlashCommand but WITHOUT the leading Esc — for slash commands that apply
+// even mid-response (e.g. /effort), so setting one doesn't cancel a running turn.
+async function typeSlashCommand(cmd: string): Promise<boolean> {
   if (!tmuxSendKeys(['-l', '--', cmd])) return false
   await sleep(150)
   return tmuxSendKeys(['Enter'])
@@ -1373,6 +1406,37 @@ async function handleInbound(
     await sendCapture(ctx, pane)
     return
   }
+  // /effort [level] → set reasoning effort. With a level, inject it directly (it
+  // applies even mid-response, so no Esc/cancel). No arg → a button picker, like /resume.
+  if (EFFORT_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /effort — agent is not running inside tmux.')
+      return
+    }
+    const arg = (EFFORT_RE.exec(text)?.[1] ?? '').trim().toLowerCase()
+    if (arg) {
+      if (!EFFORT_LEVELS.includes(arg)) {
+        void ctx.reply(`Unknown effort "${arg.slice(0, 20)}". Choose: ${EFFORT_LEVELS.join(', ')}.`)
+        return
+      }
+      void ctx.reply(`🧠 Setting effort to ${arg}…`)
+      await typeSlashCommand(`/effort ${arg}`)
+      return
+    }
+    const kb = new InlineKeyboard()
+      .text('Low', 'effort:low')
+      .text('Medium', 'effort:medium')
+      .text('High', 'effort:high')
+      .row()
+      .text('xHigh', 'effort:xhigh')
+      .text('Max', 'effort:max')
+      .row()
+      .text('Ultracode', 'effort:ultracode')
+      .row()
+      .text('Auto (reset to default)', 'effort:auto')
+    void ctx.reply('🧠 Choose reasoning effort:', { reply_markup: kb })
+    return
+  }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
@@ -1446,6 +1510,7 @@ void (async () => {
               { command: 'clear', description: 'Clear the session context' },
               { command: 'compact', description: 'Compact the conversation' },
               { command: 'capture', description: 'Send the terminal screen to Telegram' },
+              { command: 'effort', description: 'Set the model reasoning effort' },
               { command: 'resume', description: 'Resume a past session' },
               { command: 'rename', description: 'Rename this session' },
             ],
