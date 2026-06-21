@@ -104,6 +104,9 @@ const CAPTURE_RE = /^\s*\/capture\b/i
 // mustn't cancel a running turn. No arg → a button picker, like /resume.
 const EFFORT_RE = /^\s*\/effort\b\s*([\s\S]*)$/i
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode', 'auto']
+// /statusline → reply with the session's statusline (context %, plan limits, cost).
+// Those live values only exist in the running TUI, so we read them off the pane.
+const STATUSLINE_RE = /^\s*\/statusline\b/i
 // The listener runs from $HOME, so its session transcripts live under the project
 // dir for that cwd (Claude encodes the path by replacing '/' with '-').
 const PROJECT_DIR = join(homedir(), '.claude', 'projects', homedir().replace(/\//g, '-'))
@@ -1066,6 +1069,17 @@ async function sendCapture(ctx: Context, capture: string): Promise<void> {
   const plain = `${header}\n\n${body}`
   await ctx.reply(plain.length > MAX_CHUNK_LIMIT ? plain.slice(0, MAX_CHUNK_LIMIT - 1) + '…' : plain).catch(() => {})
 }
+// Pull the statusline out of a pane capture. It's the bottom-most line carrying
+// the live context % (`ctx:NN%`) — the most stable marker — falling back to the
+// line showing the model id (the statusline always prints it). '' if not found.
+function extractStatusline(capture: string): string {
+  const lines = capture.split('\n')
+  const ctxHits = lines.filter(l => /\bctx:\s*\d+%/i.test(l))
+  if (ctxHits.length) return ctxHits[ctxHits.length - 1].trim()
+  const modelHits = lines.filter(l => /claude-(opus|sonnet|haiku|fable)-/i.test(l))
+  if (modelHits.length) return modelHits[modelHits.length - 1].trim()
+  return ''
+}
 
 // --- /resume: a session picker rendered as Telegram buttons ------------------
 // Claude has no non-interactive "list sessions", so we enumerate transcripts
@@ -1437,6 +1451,29 @@ async function handleInbound(
     void ctx.reply('🧠 Choose reasoning effort:', { reply_markup: kb })
     return
   }
+  // /statusline → reply with the session's statusline (context %, plan limits, cost),
+  // read from the pane. Read-only, like /capture.
+  if (STATUSLINE_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /statusline — agent is not running inside tmux.')
+      return
+    }
+    const pane = await captureTmux()
+    const line = extractStatusline(pane)
+    if (line) {
+      void ctx.reply(`📊 Statusline:\n${line}`)
+      return
+    }
+    // couldn't pinpoint it — return the last couple of non-empty lines as a best guess
+    const tail = pane
+      .split('\n')
+      .map(l => l.replace(/[ \t]+$/, ''))
+      .filter(l => l.trim())
+      .slice(-2)
+      .join('\n')
+    void ctx.reply(tail ? `📊 Statusline (best guess):\n${tail}` : '⚠️ Could not read the statusline from the pane.')
+    return
+  }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
@@ -1510,6 +1547,7 @@ void (async () => {
               { command: 'clear', description: 'Clear the session context' },
               { command: 'compact', description: 'Compact the conversation' },
               { command: 'capture', description: 'Send the terminal screen to Telegram' },
+              { command: 'statusline', description: 'Show the statusline (context, limits, cost)' },
               { command: 'effort', description: 'Set the model reasoning effort' },
               { command: 'resume', description: 'Resume a past session' },
               { command: 'rename', description: 'Rename this session' },
