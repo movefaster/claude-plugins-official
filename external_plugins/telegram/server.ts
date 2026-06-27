@@ -1222,6 +1222,18 @@ function listSessions(): SessionInfo[] {
     out.push({ id: f.replace(/\.jsonl$/, ''), mtime, ...info })
   }
   out.sort((a, b) => b.mtime - a.mtime)
+  // A custom title is carried forward into every /resume descendant (Claude copies
+  // the title and rewrites each entry's sessionId to the new session), so a single
+  // rename can surface the same name on many sessions. Keep the title only on the
+  // most-recent session that bears it; older copies fall back to their opener
+  // preview. (out is sorted newest-first, so the first occurrence is the keeper.)
+  const titledSeen = new Set<string>()
+  for (const s of out) {
+    if (!s.title) continue
+    const key = s.title.toLowerCase()
+    if (titledSeen.has(key)) s.title = undefined
+    else titledSeen.add(key)
+  }
   return out.slice(0, MAX_RESUME_LIST)
 }
 
