@@ -90,6 +90,7 @@ commands reply that they can't run and do nothing else.
 | `/capture` | Snapshots the agent's terminal pane (recent scrollback + the visible screen) back to Telegram as a monospaced block. **Read-only** — injects nothing, so it's safe to run mid-turn to check what the session is doing. |
 | `/statusline` | Replies with the session's statusline (context %, plan session/weekly limits, cost) — read from the pane, so you can check usage from Telegram. **Read-only.** |
 | `/effort [level]` | Sets the model's reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`, `ultracode`, `auto`). With no arg, replies with a button picker (like `/resume`). Applies immediately — even mid-response — so it's injected **without** an Esc and won't cancel a running turn. |
+| `/type <keys…>` | **Catch-all** — sends raw keystrokes to the pane for any TUI interaction the commands above don't wrap (menus, dialogs, mode toggles, Ctrl-keys). Replies with the resulting pane. See below. |
 | `/rename [name]` | Runs the TUI `/rename` to retitle the session (in-place). With a name it sets it directly; with no arg Claude auto-generates one from history. |
 | `/resume` | Replies with a text list of recent workspace sessions (each session's **title** if set via `/rename`, else its opener + **your** last 3 messages, ~100 chars each) plus **inline buttons below the message** — tap one to resume. `/resume <id\|prefix>` also works typed. Resuming relaunches the session (channels re-attach). |
 
@@ -102,6 +103,19 @@ and `/compact` only register at an idle prompt, so the poller presses Esc first
 types the command. The bot acks on Telegram *before* `/clear` (which discards the
 agent's context); the poller is a separate process, so its replies — and future
 message handling — survive the clear.
+
+`/type` is the escape hatch the other commands narrow down from: each of them wraps
+one interaction, `/type` covers the rest of the TUI. Its arguments are split on
+whitespace; a token that names a key is sent as that **key**, anything else is typed
+as **text** (consecutive text tokens rejoin with single spaces, so
+`/type yes do it Enter` types the sentence and submits). Quote a token to force text
+(`/type "Enter"` types the word). Recognized keys: `Enter` `Escape` `Tab` `BTab`
+`Space` `BSpace` `Up` `Down` `Left` `Right` `Home` `End` `PageUp` `PageDown`
+`Delete` `Insert` `F1`–`F12`, plus `C-`/`M-`/`S-` combos (`C-c`, `S-Tab`, `C-M-a`).
+Nothing is injected implicitly — no leading Esc, no trailing Enter — so what you send
+is exactly what the pane gets; after sending it replies with a fresh pane capture so
+you can see the effect. Keys go straight to the terminal, so this can do anything you
+could do at the keyboard (`C-c`, `C-d` included).
 
 `/resume` enumerates sessions itself — Claude has no non-interactive "list
 sessions", so the poller scans the transcript dir (`~/.claude/projects/<cwd>/<id>.jsonl`)

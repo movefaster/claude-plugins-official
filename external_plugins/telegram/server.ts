@@ -107,6 +107,47 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode', 'au
 // /statusline → reply with the session's statusline (context %, plan limits, cost).
 // Those live values only exist in the running TUI, so we read them off the pane.
 const STATUSLINE_RE = /^\s*\/statusline\b/i
+// /type <keys…> → the catch-all: send raw keystrokes to the pane, for any TUI
+// interaction the commands above don't cover (menus, dialogs, mode switches).
+const TYPE_RE = /^\s*\/type\b\s*([\s\S]*)$/i
+// Tokens naming a key are sent as that key; anything else is typed as text. Maps
+// the aliases people actually write to tmux's spelling, so we never depend on
+// tmux's own case/alias handling.
+const KEY_NAMES: Record<string, string> = {
+  enter: 'Enter',
+  return: 'Enter',
+  escape: 'Escape',
+  esc: 'Escape',
+  tab: 'Tab',
+  btab: 'BTab',
+  shifttab: 'BTab',
+  'shift-tab': 'BTab',
+  space: 'Space',
+  bspace: 'BSpace',
+  backspace: 'BSpace',
+  bs: 'BSpace',
+  up: 'Up',
+  down: 'Down',
+  left: 'Left',
+  right: 'Right',
+  home: 'Home',
+  end: 'End',
+  pageup: 'PageUp',
+  pgup: 'PageUp',
+  ppage: 'PageUp',
+  pagedown: 'PageDown',
+  pgdn: 'PageDown',
+  npage: 'PageDown',
+  delete: 'Delete',
+  del: 'Delete',
+  insert: 'Insert',
+  ins: 'Insert',
+  ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`f${i + 1}`, `F${i + 1}`])),
+}
+// Modifier combos: C-c, M-x, S-Tab, C-M-a. Base is a single char or a key name.
+const MODIFIER_KEY_RE = /^((?:[cms]-)+)(.+)$/i
+const MAX_TYPE_CHUNKS = 40
+const MAX_TYPE_CHARS = 1000
 // The listener runs from $HOME, so its session transcripts live under the project
 // dir for that cwd (Claude encodes the path by replacing '/' with '-').
 const PROJECT_DIR = join(homedir(), '.claude', 'projects', homedir().replace(/\//g, '-'))
@@ -1019,6 +1060,64 @@ async function typeSlashCommand(cmd: string): Promise<boolean> {
   return tmuxSendKeys(['Enter'])
 }
 
+// --- /type: raw keystrokes, the catch-all for everything else ----------------
+// The commands above each wrap one interaction; /type is the escape hatch for the
+// rest of the TUI (menus, dialogs, mode toggles, Ctrl-keys). Whitespace-separated
+// tokens: a token naming a key (Enter, Up, C-c, S-Tab, F2 …) is sent as that KEY,
+// anything else is typed as TEXT — so `Down Down Enter` navigates a menu while
+// `continue please Enter` types a sentence and submits. Consecutive text tokens
+// rejoin with single spaces; quote a token ("Enter") to type it as text instead
+// (quoting keeps its inner spacing, and still joins to neighbouring text with one
+// space, so the pane gets back exactly what was typed on Telegram).
+// Nothing is injected implicitly — no leading Esc, no trailing Enter.
+type KeyChunk = { key: string } | { text: string }
+function parseKeystrokes(input: string): KeyChunk[] {
+  const chunks: KeyChunk[] = []
+  for (const m of input.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) {
+    const quoted = m[1] ?? m[2]
+    if (quoted !== undefined) {
+      if (quoted) chunks.push({ text: quoted })
+      continue
+    }
+    const tok = m[3]!
+    const key = keyName(tok)
+    if (key) {
+      chunks.push({ key })
+      continue
+    }
+    // plain text — merge with a preceding text chunk so spaces survive tokenizing
+    const prev = chunks[chunks.length - 1]
+    if (prev && 'text' in prev) prev.text += ` ${tok}`
+    else chunks.push({ text: tok })
+  }
+  return chunks
+}
+// The tmux spelling of a key token, or '' if it's just text.
+function keyName(tok: string): string {
+  const direct = KEY_NAMES[tok.toLowerCase()]
+  if (direct) return direct
+  const mod = MODIFIER_KEY_RE.exec(tok)
+  if (!mod) return ''
+  const base = mod[2]!
+  // C-c keeps the char as typed (case is meaningful); C-pgdn → C-PageDown. A
+  // multi-char base that isn't a key name (C-3PO) is text, not a keystroke.
+  const named = KEY_NAMES[base.toLowerCase()] ?? (base.length === 1 ? base : '')
+  return named ? mod[1]!.toUpperCase() + named : ''
+}
+// Send the chunks in order. Each send-keys is its own (async) tmux process, so
+// space them out — back-to-back spawns could otherwise land out of order.
+async function sendKeystrokes(chunks: KeyChunk[]): Promise<boolean> {
+  for (const [i, c] of chunks.entries()) {
+    if (i) await sleep(80)
+    const ok = 'key' in c ? tmuxSendKeys(['--', c.key]) : tmuxSendKeys(['-l', '--', c.text])
+    if (!ok) return false
+  }
+  return true
+}
+function describeKeystrokes(chunks: KeyChunk[]): string {
+  return chunks.map(c => ('key' in c ? `[${c.key}]` : `“${c.text}”`)).join(' ')
+}
+
 // Read the agent's tmux pane (recent scrollback through the visible screen) as
 // plain text — read-only, injects nothing. Non-blocking with a hard timeout so a
 // wedged tmux can't stall the poller. Same capture the watchdog uses, on demand.
@@ -1054,12 +1153,13 @@ function captureTmux(scrollback = 200): Promise<string> {
 // Send a pane snapshot as a monospaced block. Tries a MarkdownV2 code fence
 // (escaping ` and \ inside) and falls back to plain text so a parse error never
 // drops the message; tail-trimmed to keep the most recent rows under the limit.
-async function sendCapture(ctx: Context, capture: string): Promise<void> {
-  const header = '📷 Terminal pane'
+// The header is caller-supplied text (e.g. the keystrokes /type just sent), so it
+// gets the full MarkdownV2 escape — an unescaped '[' there would kill the message.
+async function sendCapture(ctx: Context, capture: string, header = '📷 Terminal pane'): Promise<void> {
   const MAXCAP = 3500
   const body = capture.length > MAXCAP ? '…\n' + capture.slice(capture.length - MAXCAP) : capture
   const fenced = '```\n' + body.replace(/\\/g, '\\\\').replace(/`/g, '\\`') + '\n```'
-  const md = `${header}\n\n${fenced}`
+  const md = `${header.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, c => '\\' + c)}\n\n${fenced}`
   if (md.length <= MAX_CHUNK_LIMIT) {
     try {
       await ctx.reply(md, { parse_mode: 'MarkdownV2' })
@@ -1486,6 +1586,45 @@ async function handleInbound(
     void ctx.reply(tail ? `📊 Statusline (best guess):\n${tail}` : '⚠️ Could not read the statusline from the pane.')
     return
   }
+  // /type <keys…> → the catch-all: send raw keystrokes to the pane for whatever the
+  // commands above don't wrap. Injects exactly what was asked for (no Esc, no Enter),
+  // then replies with the resulting pane so the sender isn't driving the TUI blind.
+  if (TYPE_RE.test(text)) {
+    if (!inTmux()) {
+      void ctx.reply('⚠️ Cannot /type — agent is not running inside tmux.')
+      return
+    }
+    const arg = (TYPE_RE.exec(text)?.[1] ?? '').trim()
+    const chunks = arg.length <= MAX_TYPE_CHARS ? parseKeystrokes(arg) : []
+    if (!chunks.length || chunks.length > MAX_TYPE_CHUNKS) {
+      void ctx.reply(
+        'Usage: /type <keys…> — sends keystrokes straight to the terminal.\n\n' +
+          'Key names go through as keys, anything else is typed as text:\n' +
+          '• /type Down Down Enter — pick the 3rd menu item\n' +
+          '• /type 2 Enter — answer a numbered prompt\n' +
+          '• /type C-c — send Ctrl-C\n' +
+          '• /type S-Tab — cycle the permission mode\n' +
+          '• /type yes do it Enter — type a sentence and submit\n' +
+          '• /type "Enter" — type the word (quote to force text)\n\n' +
+          'Keys: Enter Escape Tab BTab Space BSpace Up Down Left Right Home End PageUp PageDown Delete Insert F1-F12, ' +
+          'plus C-/M-/S- combos. Nothing extra is added — no Esc first, no Enter after.',
+      )
+      return
+    }
+    const desc = describeKeystrokes(chunks)
+    if (!(await sendKeystrokes(chunks))) {
+      void ctx.reply('⚠️ Could not send the keystrokes to the pane.')
+      return
+    }
+    await sleep(800) // let the TUI redraw so the capture shows the effect
+    const pane = await captureTmux()
+    if (!pane) {
+      void ctx.reply(`⌨️ Sent: ${desc}`)
+      return
+    }
+    await sendCapture(ctx, pane, `⌨️ Sent: ${desc}`)
+    return
+  }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
@@ -1561,6 +1700,7 @@ void (async () => {
               { command: 'capture', description: 'Send the terminal screen to Telegram' },
               { command: 'statusline', description: 'Show the statusline (context, limits, cost)' },
               { command: 'effort', description: 'Set the model reasoning effort' },
+              { command: 'type', description: 'Send raw keystrokes to the terminal' },
               { command: 'resume', description: 'Resume a past session' },
               { command: 'rename', description: 'Rename this session' },
             ],
